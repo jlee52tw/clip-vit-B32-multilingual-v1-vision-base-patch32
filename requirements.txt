@@ -1,0 +1,5 @@
+pillow
+torch
+transformers
+openvino
+openvino-tokenizers
