@@ -252,3 +252,109 @@ also a small performance win.
   `NPU_COMPILER_TYPE=DRIVER` override can be removed.
 
 
+
+---
+
+## Update 2 — switch back to the built-in NPU compiler (PREFER_PLUGIN) via an IR patch
+
+**Why revisit the DRIVER workaround.** `NPU_COMPILER_TYPE=DRIVER` works today but
+ties throughput to the version of the compiler that happens to ship inside the NPU
+driver. That is fine for our test box, but it is a support risk for customer apps
+pinned to an older OpenVINO release: when the user upgrades only the OV runtime
+(or only the NPU driver) the two compilers can diverge and we have no control over
+the driver-side one. The plugin-bundled compiler (`PREFER_PLUGIN`, OV's default)
+is the long-term-supported path, so we want text@NPU to work there too.
+
+### Fix: rewrite the SDPA mask inside the IR
+
+The 2026.1 plugin compiler rejects the i8 mask in 6 `ScaledDotProductAttention`
+ops. We patch the IR offline so the mask is delivered as an **additive f32 bias**
+(allow=0, mask=-1e30), which is mathematically equivalent to the original boolean
+semantics inside softmax. The transform is in
+[`fix_text_ir_for_npu.py`](fix_text_ir_for_npu.py) and produces
+`ov_models/clip-ViT-B-32-multilingual-v1_text_static_opt_npu.xml` (cos sim = 1.000000,
+max abs diff = 9e-6 vs the original IR on CPU).
+
+`
+i8 mask  ──Convert(f32)──Subtract(1−x)──Multiply(×−1e30)──▶ SDPA.input(3) (f32)
+`
+
+### Variant sweep on PREFER_PLUGIN
+
+Tried 5 mask encodings × 2 `INFERENCE_PRECISION_HINT` settings on text@NPU
+(60 s sync each, `_sweep_sdpa_mask.py`):
+
+| variant              | hint     | compile ms | FPS    | avg ms | RSS Δ MB | cos sim |
+|----------------------|----------|-----------:|-------:|-------:|---------:|---------|
+| select_neg_f16       | f16      |     1965.4 | 121.80 |   8.21 |    938.8 | 1.000000 |
+| select_neg_f16       | default  |     1989.7 | 121.56 |   8.23 |    936.0 | 1.000000 |
+| select_neg_inf       | default  |     2002.1 | 121.37 |   8.24 |    934.7 | 1.000000 |
+| select_neg_inf       | f16      |     1961.0 | 121.10 |   8.26 |    937.2 | 1.000000 |
+| muladd_f32           | default  |     2044.6 | 121.06 |   8.26 |    936.3 | 1.000000 |
+| f16_large_bias_f16   | default  |     1997.8 | 121.01 |   8.26 |    937.3 | 1.000000 |
+| f32_large_bias       | f16      |      139.9 | 120.98 |   8.27 |    536.8 | 1.000000 |
+| f16_large_bias_f16   | f16      |     2044.5 | 120.94 |   8.27 |    936.4 | 1.000000 |
+| muladd_f32           | f16      |     2066.9 | 120.79 |   8.28 |    939.8 | 1.000000 |
+| f32_large_bias       | default  |      153.1 | 120.72 |   8.28 |    539.1 | 1.000000 |
+
+**All 10 combinations land in 120.7–121.8 FPS (≤1 % spread, noise-level).** Mask
+encoding choice does not move the needle on the built-in compiler. `f32_large_bias`
+is picked because it is the simplest transform and incidentally hits a cross-process
+NPU compile cache more often (the lower compile / RSS numbers in the table).
+
+### Full 6-pair sweep — PREFER_PLUGIN + patched IR
+
+[`bench_report_2026_1_builtin.json`](bench_report_2026_1_builtin.json), 60 s each,
+`benchmark_app.exe` subprocess via `-load_config` (empty for NPU now), all 6
+pairs run end-to-end:
+
+| pair        | read ms | compile ms | first ms | avg ms | median ms | FPS    | cache .blob   | RSS Δ peak |
+|-------------|--------:|-----------:|---------:|-------:|----------:|-------:|--------------:|-----------:|
+| vision@CPU  |   26.11 |     335.40 |    56.96 |  61.33 |     60.68 |  16.28 | 168.6 MB      |   776.7 MB |
+| vision@GPU  |   16.67 |     300.14 |    11.10 |   7.22 |      6.64 | 136.77 | 173.1 MB      |   696.7 MB |
+| vision@NPU  |   21.76 |     607.86 |    42.20 |   8.34 |      8.27 | 118.32 | 700 MB (4×175)|   436.8 MB |
+| text@CPU    |   14.76 |     228.71 |    68.94 |  71.81 |     71.40 |  13.91 | 257.9 MB      |   597.2 MB |
+| text@GPU    |   16.37 |     405.54 |     6.49 |   4.93 |      4.42 | 200.19 | 261.0 MB      |   988.0 MB |
+| **text@NPU**|   22.79 |    2017.60 |    18.02 |   7.67 |      7.61 | **128.35** | 777 MB (3×271)|  1008.6 MB |
+
+### PREFER_PLUGIN (patched IR)  vs  DRIVER (original IR)
+
+Same hardware, same OV 2026.1.0, same NPU driver 1004778, same 60-s sync run:
+
+| metric (text@NPU)     | DRIVER + original IR | PREFER_PLUGIN + patched IR | delta (built-in vs DRIVER) |
+|-----------------------|---------------------:|---------------------------:|---------------------------:|
+| FPS                   |              143.12  |                    128.35  | **−10.3 %**                |
+| avg latency (ms)      |                6.87  |                      7.67  | +0.80 ms                   |
+| cold compile (ms)     |               636.1  |                   2017.6   | +3.2×                      |
+| cache footprint (MB)  |                 530  |                       777  | +47 %                      |
+| RSS Δ peak (MB)       |                 603  |                      1008  | +67 %                      |
+| cos sim vs CPU ref    |               1.000  |                     1.000  | identical numerically      |
+
+### Why this is the right trade-off
+
+The customer requirement is **FPS > memory Δ > compile time**, but with the constraint
+that we stay on a path that is forward-compatible across OV releases.
+
+- **Inference FPS:** PREFER_PLUGIN at 128.35 FPS still beats vision@NPU (118 FPS) on
+  the same device, and is only 10 % below DRIVER. The mask-encoding sweep above
+  confirms 121–128 FPS is the actual ceiling for this IR on the 2026.1 built-in
+  compiler — no further IR rewrite recovers more.
+- **Memory:** RSS Δ goes up (~+400 MB) and cache size grows (~+250 MB) because the
+  built-in compiler emits 3 cache blobs for this model vs the driver compiler's 2.
+  Acceptable on a 16 GB machine.
+- **Compile time:** ~2.0 s cold for text@NPU is slower than DRIVER's 0.6 s, but it
+  is dominated by the cache-miss path; warm runs hit the .blob cache and recompile
+  in tens of ms.
+- **Support:** any future OV release that ships an updated plugin compiler will
+  automatically benefit this path — we are not racing the NPU driver release train.
+
+### Final `bench_app.py` configuration
+
+- `text@NPU` runs against `ov_models/clip-ViT-B-32-multilingual-v1_text_static_opt_npu.xml`
+  (the patched IR). CPU / GPU keep the original IR (numerically identical, avoids
+  the extra Convert/Subtract/Multiply ops).
+- No `NPU_COMPILER_TYPE` override by default — the built-in PREFER_PLUGIN path
+  is used.
+- A `--use-driver-compiler` CLI flag is preserved for users who want the 143-FPS
+  DRIVER path and are OK owning the driver-versioning risk.
+

@@ -32,11 +32,37 @@ CACHE_ROOT = ROOT / "bench_cache"
 
 VISION_XML = ROOT / "ov_models" / "clip-vit-base-patch32_vision_static_fully_opt.xml"
 TEXT_XML = ROOT / "ov_models" / "clip-ViT-B-32-multilingual-v1_text_static_opt.xml"
+# NPU-compatible variant of the text IR: SDPA mask rewritten from i8 to f32
+# additive bias so the OV 2026.1 plugin-bundled NPU MLIR compiler accepts it.
+# See fix_text_ir_for_npu.py for the graph transform. cos sim = 1.0 vs original.
+TEXT_XML_NPU = ROOT / "ov_models" / "clip-ViT-B-32-multilingual-v1_text_static_opt_npu.xml"
 
 MODELS = {
     "vision": {"xml": VISION_XML, "shape": "pixel_values[1,3,224,224]"},
     "text":   {"xml": TEXT_XML,   "shape": "input_ids[1,128],attention_mask[1,128]"},
 }
+
+
+def _ensure_text_npu_ir() -> None:
+    """Generate the NPU-compatible text IR if it is missing. The .bin is too
+    large to commit, so we regenerate on demand from the original IR."""
+    if TEXT_XML_NPU.exists() and TEXT_XML_NPU.with_suffix(".bin").exists():
+        return
+    if not TEXT_XML.exists():
+        raise FileNotFoundError(f"Cannot patch text IR: source missing at {TEXT_XML}")
+    print(f"[setup] patched NPU text IR not found, generating {TEXT_XML_NPU.name} ...")
+    import subprocess as _sp
+    _sp.check_call([sys.executable, str(ROOT / "fix_text_ir_for_npu.py")])
+
+
+def _resolve_text_xml_for_device(device: str) -> Path:
+    """Pick the right text IR for the device. NPU needs the patched mask;
+    CPU/GPU accept either (numerically identical, cos sim = 1.0) and using the
+    original avoids the extra Convert/Subtract/Multiply chain."""
+    if device.upper() == "NPU":
+        _ensure_text_npu_ir()
+        return TEXT_XML_NPU
+    return TEXT_XML
 
 NITER = 100        # number of inference iterations per measurement
 DURATION = 0       # use niter, not time
@@ -68,17 +94,25 @@ def dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+# Toggled by the --use-driver-compiler CLI flag. When True, NPU compiles are
+# forced through NPU_COMPILER_TYPE=DRIVER (newer compiler shipped with NPU
+# driver >= 1004778). Default False so we stay on the plugin-bundled compiler
+# (PREFER_PLUGIN), which is the long-term supported path: future OV releases
+# may stop carrying the driver-side compiler, and customer apps pinned to
+# older OV need a driver compiler that is still compatible -- a support risk.
+USE_DRIVER_COMPILER = False
+
+
 def _device_config(device: str) -> dict:
     """Device-specific compile properties.
 
-    On OpenVINO 2026.1 official, the plugin-bundled NPU MLIR compiler rejects
-    the int8 attention-mask operand emitted by SDPA in the multilingual text
-    model ("'IE.SDPA' op operand #3 must be ranked tensor of 16-bit float or
-    32-bit float values, but got 'tensor<1x1x128x128xi8>'"). Switching to the
-    driver-side compiler (NPU driver >= 1004778 carries a newer compiler that
-    accepts i8 masks) sidesteps the bug. The override is harmless for the
-    vision model."""
-    if device.upper() == "NPU":
+    The 2026.1 plugin NPU compiler rejects the i8 SDPA mask in the original
+    multilingual text IR. We avoid that by feeding it the patched _npu.xml
+    (see TEXT_XML_NPU above) instead of changing the compiler. Only when
+    --use-driver-compiler is set do we force NPU_COMPILER_TYPE=DRIVER, which
+    is ~15% faster on this workload but ties throughput to NPU driver
+    versioning."""
+    if device.upper() == "NPU" and USE_DRIVER_COMPILER:
         return {"NPU_COMPILER_TYPE": "DRIVER"}
     return {}
 
@@ -242,7 +276,13 @@ def main():
     ap.add_argument("--no-wipe-cache", action="store_true",
                     help="Keep existing bench_cache (warm-cache run).")
     ap.add_argument("--save-json", default="bench_report.json")
+    ap.add_argument("--use-driver-compiler", action="store_true",
+                    help="Force NPU_COMPILER_TYPE=DRIVER on NPU (faster but tied "
+                         "to NPU driver versioning; default uses the plugin-bundled "
+                         "compiler + the patched _npu.xml IR).")
     args = ap.parse_args()
+    global USE_DRIVER_COMPILER
+    USE_DRIVER_COMPILER = args.use_driver_compiler
 
     print("=== Benchmark configuration ===")
     print(f"  OpenVINO dist : {os.environ.get('INTEL_OPENVINO_DIR', '<not set>')}")
@@ -255,6 +295,7 @@ def main():
     print(f"  api           : {API}")
     print(f"  hint          : latency")
     print(f"  wipe cache    : {not args.no_wipe_cache}")
+    print(f"  NPU compiler  : {'DRIVER (forced)' if USE_DRIVER_COMPILER else 'PREFER_PLUGIN (default, uses patched _npu.xml for text)'}")
     print("  models on disk:")
     for mname in args.models:
         x = MODELS[mname]["xml"].resolve()
@@ -273,20 +314,23 @@ def main():
         mcfg = MODELS[mname]
         for dev in args.devices:
             key = f"{mname}@{dev}"
+            # text@NPU needs the patched IR (i8 mask -> f32 bias) for the
+            # plugin-bundled compiler; CPU/GPU keep the original.
+            model_xml = _resolve_text_xml_for_device(dev) if mname == "text" else mcfg["xml"]
             print(f"\n=== {key} ===")
-            print(f"  model : {mcfg['xml'].resolve()}")
+            print(f"  model : {model_xml.resolve()}")
             print(f"  shape : {mcfg['shape']}")
             cache_dir = CACHE_ROOT / mname / dev
             print(f"  cdir  : {cache_dir.resolve()}")
             t0 = time.time()
-            m = run_benchmark(mcfg["xml"], dev, mcfg["shape"], cache_dir,
+            m = run_benchmark(model_xml, dev, mcfg["shape"], cache_dir,
                               niter=args.niter or None,
                               duration=args.duration or None)
             m["wallclock_s"] = round(time.time() - t0, 2)
             m["args"] = {"niter": args.niter, "duration": args.duration,
                          "api": API, "hint": "latency",
                          "shape": mcfg["shape"],
-                         "model": str(mcfg["xml"].resolve()),
+                         "model": str(model_xml.resolve()),
                          "cdir": str(cache_dir.resolve())}
             results[key] = m
             print(
@@ -304,7 +348,7 @@ def main():
                 print(f"  WARN benchmark_app exit={m['returncode']} (likely NPU property query bug). Running in-process fallback...")
             if m["avg"] is None:
                 try:
-                    fb = inproc_latency(mcfg["xml"], dev, mname, cache_dir,
+                    fb = inproc_latency(model_xml, dev, mname, cache_dir,
                                         niter=args.niter or None,
                                         duration=args.duration or None)
                     # keep cache bytes/memory from subprocess run; overwrite latency fields
