@@ -68,6 +68,21 @@ def dir_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
 
 
+def _device_config(device: str) -> dict:
+    """Device-specific compile properties.
+
+    On OpenVINO 2026.1 official, the plugin-bundled NPU MLIR compiler rejects
+    the int8 attention-mask operand emitted by SDPA in the multilingual text
+    model ("'IE.SDPA' op operand #3 must be ranked tensor of 16-bit float or
+    32-bit float values, but got 'tensor<1x1x128x128xi8>'"). Switching to the
+    driver-side compiler (NPU driver >= 1004778 carries a newer compiler that
+    accepts i8 masks) sidesteps the bug. The override is harmless for the
+    vision model."""
+    if device.upper() == "NPU":
+        return {"NPU_COMPILER_TYPE": "DRIVER"}
+    return {}
+
+
 def run_benchmark(model_xml: Path, device: str, shape: str, cache_dir: Path,
                   niter: int | None = None, duration: int | None = None) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -82,6 +97,11 @@ def run_benchmark(model_xml: Path, device: str, shape: str, cache_dir: Path,
         "-cdir", str(cache_dir.resolve()),
         "-report_type", "no_counters",
     ]
+    dev_cfg = _device_config(device)
+    if dev_cfg:
+        cfg_path = cache_dir / "_bench_load_config.json"
+        cfg_path.write_text(json.dumps({device.upper(): dev_cfg}))
+        cmd += ["-load_config", str(cfg_path.resolve())]
     if duration is not None and duration > 0:
         cmd += ["-t", str(duration)]
     if niter is not None and niter > 0:
@@ -166,7 +186,7 @@ def inproc_latency(model_xml: Path, device: str, model_kind: str, cache_dir: Pat
     model = core.read_model(model_xml)
     read_ms = (time.perf_counter() - t0) * 1000
     t0 = time.perf_counter()
-    cm = core.compile_model(model, device)
+    cm = core.compile_model(model, device, _device_config(device))
     compile_ms = (time.perf_counter() - t0) * 1000
 
     feed = {}
@@ -283,18 +303,23 @@ def main():
             if m["returncode"] != 0:
                 print(f"  WARN benchmark_app exit={m['returncode']} (likely NPU property query bug). Running in-process fallback...")
             if m["avg"] is None:
-                fb = inproc_latency(mcfg["xml"], dev, mname, cache_dir,
-                                    niter=args.niter or None,
-                                    duration=args.duration or None)
-                # keep cache bytes/memory from subprocess run; overwrite latency fields
-                for k2 in ("read", "load", "first", "avg", "median", "min", "max", "thr"):
-                    m[k2] = fb[k2]
-                m["fallback"] = "inproc"
-                print(
-                    f"  [inproc] read={fmt(m['read'],' ms')} compile={fmt(m['load'],' ms')} "
-                    f"first={fmt(m['first'],' ms')} avg={fmt(m['avg'],' ms')} "
-                    f"median={fmt(m['median'],' ms')} thr={fmt(m['thr'],' FPS')}"
-                )
+                try:
+                    fb = inproc_latency(mcfg["xml"], dev, mname, cache_dir,
+                                        niter=args.niter or None,
+                                        duration=args.duration or None)
+                    # keep cache bytes/memory from subprocess run; overwrite latency fields
+                    for k2 in ("read", "load", "first", "avg", "median", "min", "max", "thr"):
+                        m[k2] = fb[k2]
+                    m["fallback"] = "inproc"
+                    print(
+                        f"  [inproc] read={fmt(m['read'],' ms')} compile={fmt(m['load'],' ms')} "
+                        f"first={fmt(m['first'],' ms')} avg={fmt(m['avg'],' ms')} "
+                        f"median={fmt(m['median'],' ms')} thr={fmt(m['thr'],' FPS')}"
+                    )
+                except Exception as e:
+                    m["fallback"] = "inproc_failed"
+                    m["fallback_error"] = str(e).splitlines()[0][:300]
+                    print(f"  [inproc] FAILED: {m['fallback_error']}")
 
     Path(args.save_json).write_text(json.dumps(results, indent=2))
 

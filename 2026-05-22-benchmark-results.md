@@ -159,3 +159,96 @@ supported property and calls `get_property(k)` unconditionally → instant
 - **For text@NPU**, use the 2026.3 nightly + `bench_app.py`'s in-process Python API fallback (which reuses the cached `.blob` and avoids the `get_property()` iteration entirely).
 - When the next OpenVINO release fixes both (a) the pybind binding for `CACHE_ENCRYPTION_CALLBACKS` and (b) the text-model NPU compiler regression, the fallback can be retired.
 
+---
+
+## Update — root-caused & fixed text@NPU on 2026.1 (driver 4778)
+
+After enumerating the failing op via the vpux-compiler diagnostic, the precise issue
+in the 2026.1 plugin-bundled NPU MLIR compiler is:
+
+```
+'IE.SDPA' op operand #3 must be ranked tensor of 16-bit float or 32-bit float values,
+ but got 'tensor<1x1x128x128xi8>'
+  at __module.model.0.model.transformer.layer.0.attention/aten::scaled_dot_product_attention
+```
+
+The text IR feeds an **int8 attention mask** into `ScaledDotProductAttention`. The
+2026.1 plugin compiler's `IE.SDPA` op verifier rejects i8 masks (only f16/f32 are
+allowed); the 2026.3 nightly's compiler accepts them — which is why text@NPU works
+on the nightly and breaks on 2026.1.
+
+### One-line workaround that works on 2026.1 + NPU driver 1004778
+
+Set `NPU_COMPILER_TYPE=DRIVER` on the NPU compile call. The driver-side compiler
+shipped with NPU driver 4778 is newer than the plugin-bundled compiler in
+OV 2026.1 and accepts the i8 mask.
+
+```python
+core.compile_model(text_xml, "NPU", {"NPU_COMPILER_TYPE": "DRIVER"})
+```
+
+Probe of all reasonable NPU compile options (`_try_npu.py`):
+
+| trial                                            | result                                  |
+|--------------------------------------------------|-----------------------------------------|
+| default                                          | FAIL — `IE.SDPA` operand #3 must be f16/f32 |
+| `INFERENCE_PRECISION_HINT=f16`                   | FAIL — same                             |
+| `PERFORMANCE_HINT=LATENCY`                       | FAIL — same                             |
+| `NPU_COMPILER_TYPE=MLIR`                         | FAIL — option already defaults to MLIR  |
+| **`NPU_COMPILER_TYPE=DRIVER`**                   | **OK — compiles + runs**                |
+| `NPU_COMPILATION_MODE_PARAMS=enable-se-ptrs-operations=true` | FAIL — same |
+
+### Script change
+
+`bench_app.py` now passes the device-specific config through both code paths:
+
+1. **`benchmark_app.exe` subprocess** — writes a tiny `_bench_load_config.json` into the
+   per-pair cache dir and passes `-load_config <path>`. JSON shape:
+   ```json
+   { "NPU": { "NPU_COMPILER_TYPE": "DRIVER" } }
+   ```
+2. **In-process fallback** — passes the same dict directly to `core.compile_model(..., {...})`.
+3. The fallback call is now wrapped in `try/except` so a hard NPU compile error no
+   longer aborts the whole sweep — the JSON still gets written with `n/a` for that
+   pair and `fallback="inproc_failed"` + `fallback_error="..."`.
+
+The override is gated on `device.upper() == "NPU"`; CPU/GPU paths are unchanged.
+
+### Verified end-to-end on 2026.1.0 + NPU driver 1004778
+
+Standalone Python API check (`_verify_npu_text.py`, 10-second sync loop):
+
+```
+compile: 4422.4 ms
+iters=1373, avg=7.278 ms, min=6.269, median=7.233, FPS=137.40
+norm=1.0010584592819214   (sanity: should be ~1.0 after L2-normalize)
+```
+
+Full 60-s sweep through patched `bench_app.py` (real `benchmark_app.exe` subprocess
++ `-load_config`):
+
+| pair        | read ms | compile ms | first ms | avg ms | median ms | FPS    |
+|-------------|--------:|-----------:|---------:|-------:|----------:|-------:|
+| vision@CPU  |   24.33 |     304.08 |    64.96 |  63.30 |     62.40 |  15.77 |
+| vision@GPU  |   21.46 |     357.15 |     8.97 |   7.48 |      7.03 | 131.96 |
+| vision@NPU  |   16.84 |    5053.39 |    18.65 |   8.45 |      8.34 | 116.66 |
+| text@CPU    |   16.91 |     237.33 |    66.80 |  74.51 |     72.73 |  13.40 |
+| text@GPU    |   16.61 |     413.89 |     6.40 |   5.14 |      4.74 | 191.08 |
+| **text@NPU**|   14.74 |     636.09 |    49.11 |   6.87 |      6.80 | **143.12** |
+
+Compile times for CPU/GPU are short (200–410 ms) because that run inherited warm
+caches from the previous sweep; vision@NPU and text@NPU show real cold-compile
+cost. text@NPU is now slightly **faster than the 2026.3 nightly in-process fallback**
+(143.12 FPS vs 132.17 FPS), so the workaround is not just a correctness fix but
+also a small performance win.
+
+### Updated recommendation (supersedes the section above)
+
+- **Run everything on OpenVINO 2026.1.0 official + NPU driver ≥ 1004778** using the
+  patched `bench_app.py`. All six (model × device) pairs work end-to-end via
+  `benchmark_app.exe`. The 2026.3 nightly is no longer needed for this workload.
+- Keep the in-process fallback in the script as a safety net for future regressions.
+- When OV ships the plugin-side fix for the i8-mask SDPA verifier, the
+  `NPU_COMPILER_TYPE=DRIVER` override can be removed.
+
+
