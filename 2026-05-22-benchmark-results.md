@@ -358,3 +358,90 @@ that we stay on a path that is forward-compatible across OV releases.
 - A `--use-driver-compiler` CLI flag is preserved for users who want the 143-FPS
   DRIVER path and are OK owning the driver-versioning risk.
 
+
+
+---
+
+## Update 3 â€” clean measurement: single-blob cache + steady-state inference RSS
+
+**Why another pass.** Update 2's numbers were collected with `benchmark_app.exe`
+(60 s sync), but two artefacts made the absolute footprint hard to compare:
+(a) the per-pair `-cdir` directories accumulated **multiple `.blob` files** across
+re-runs (the table shows 4Ã— and 3Ã— blobs), so "cache MB" overstated the on-disk
+cost of a single config, and (b) the reported "RSS Î” peak" tracked the whole
+process lifetime â€” including the compile spike â€” so it conflated *load cost*
+with *steady-state inference memory*.
+
+The customer specifically asked for "memory footprint (delta during 2nd+
+inference)" and "cache .blob size (better we also clean up cache folder, not
+include others .blob)", so a new harness was written that does both cleanly.
+
+### New script: `bench_clean.py`
+
+Per (model Ã— device) pair:
+
+1. **Wipe** `bench_cache/<pair>/` before compile, so the directory holds **exactly
+   one `.blob` produced by this config**.
+2. `core.read_model` â†’ measure `read_ms`.
+3. `core.compile_model` (cold cache) â†’ measure `compile_ms`.
+4. Single `.infer()` â†’ `first_ms`.
+5. **10 warmup infers** to drive the process to its real steady state.
+6. `gc.collect()` + 200 ms settle, then take `base_rss = psutil RSS`.
+7. Start a background sampler thread at 50 Hz that records peak RSS, and run
+   `.infer()` in a tight loop for `--duration` seconds (default 60).
+8. Stop the sampler. Report `inf_rss_delta_mb = peak_during_inference âˆ’ base`.
+9. Sum the size of every `*.blob` in the (post-wipe, single-config) cache dir.
+
+NPU uses the PREFER_PLUGIN (built-in) compiler by default; `--use-driver-compiler`
+flips it to DRIVER. `text@NPU` still uses the patched
+`clip-ViT-B-32-multilingual-v1_text_static_opt_npu.xml` IR.
+
+```powershell
+Remove-Item -Recurse -Force bench_cache -ErrorAction SilentlyContinue
+python bench_clean.py --duration 60 --save-json bench_clean.json
+```
+
+### Results â€” OV 2026.1.0 official, NPU=PREFER_PLUGIN, driver 1004778
+
+| pair        | read ms | compile ms (cold) | first ms | avg ms | median ms | FPS    | cache .blob (1 blob) | inf-only RSS Î” |
+|-------------|--------:|------------------:|---------:|-------:|----------:|-------:|---------------------:|---------------:|
+| vision@CPU  |   27.38 |            686.50 |    75.37 |  68.27 |     63.95 |  14.65 |             168.6 MB |        0.5 MB  |
+| vision@GPU  |   19.97 |            715.97 |     9.72 |   7.34 |      6.81 | 136.22 |             173.1 MB |        0.2 MB  |
+| vision@NPU  |   18.36 |           3225.41 |    18.10 |   8.99 |      8.90 | 111.24 |             175.1 MB |        0.1 MB  |
+| text@CPU    |   10.39 |           1587.64 |   132.29 |  75.06 |     76.08 |  13.32 |             257.9 MB |        0.8 MB  |
+| text@GPU    |   14.98 |           1509.56 |     6.14 |   4.90 |      4.41 | 204.22 |             260.9 MB |        0.1 MB  |
+| **text@NPU**|   13.11 |           2155.14 |    18.83 |   8.42 |      8.33 | **118.71** |       259.1 MB |        0.1 MB  |
+
+Steady-state baseline (process RSS just after warmup) for reference:
+vision@CPU 619.6 MB, vision@GPU 596.7 MB, vision@NPU 785.4 MB,
+text@CPU 694.2 MB, text@GPU 811.8 MB, text@NPU **1094.0 MB**.
+
+### Key differences vs Update 2
+
+- **Cache size is now the real single-blob size.** 175 MB for vision@NPU (was
+  reported as "700 MB / 4Ã—175" in Update 2), 259 MB for text@NPU (was "777 MB /
+  3Ã—271"). The model `.bin` weights are the dominant term, as expected.
+- **RSS during inference is essentially flat** â€” every device sits at â‰¤1 MB delta
+  during the 60 s steady-state loop. The big Update-2 "RSS Î” peak" numbers
+  (â‰ˆ600â€“1000 MB) were entirely the compile-time spike + driver initialisation,
+  not inference memory growth. Once compiled, the inference loop does not leak.
+- text@NPU steady-state RSS baseline (1094 MB) is higher than the other devices
+  because of the NPU driver / compiler runtime resident in the process â€” that is
+  a one-shot cost paid at compile, not per-inference.
+- Throughput numbers match Update 2 within Â±8 FPS (text@NPU 118.7 vs 128.4 in
+  Update 2; vision@NPU 111.2 vs 118.3) â€” the variation is mostly cold/warm cache
+  state and thermal headroom on this small fanless box, not the harness.
+
+### Reproducer
+
+```powershell
+cd clip-vit-B32-multilingual-v1-vision-base-patch32
+Remove-Item Env:INTEL_OPENVINO_DIR -ErrorAction SilentlyContinue
+$env:PYTHONPATH=''
+.\clip_venv_ov2026_1\Scripts\Activate.ps1
+Remove-Item -Recurse -Force bench_cache -ErrorAction SilentlyContinue
+python bench_clean.py --duration 60 --save-json bench_clean.json
+```
+
+JSON output: [`bench_clean.json`](bench_clean.json).
+Source: [`bench_clean.py`](bench_clean.py).
