@@ -4,7 +4,7 @@ This project is OpenVINO based CLIP for image search.
 
 Please following below steps to get ov models and run inference.  
 
-1. Please download python `3.9`.
+1. Please download python e.g. 3.12
 2. Following below commands to create virtual envirenment and install required libraries. 
     ```sh
     python -m venv clip_venv
@@ -14,69 +14,64 @@ Please following below steps to get ov models and run inference.
     ```
 3. Get static text embedding model with offloaded post processing
     ```sh
-    python get_static_text_model.py
+    python get_static_text_model_clip_ViT_B_32_multilingual.py
     ```
     > __Notes__ 
-    > In CLIP model, the default setting of image size is `224x224` which is set for OV model and default setting of token length is `77`, now is set to `10` for OV model. 
-    > If you want to change the token length for text embedding model, please modify line `64` ~ `77` of file, `get_static_text_model.py`.
+    > In sentence-transformers/clip-ViT-B-32-multilingual-v1 model, the max token length is `128`, we set 128 as default static shape token length.
+    > If you want to change the token length for text embedding model, please modify seq_length in file `get_static_text_model_clip_ViT_B_32_multilingual.py`.
     > 
-    > * Original code:
+    > * code:
     >   ```py
-    >   if not fp16_text_model_path.exists():
-    >       ov_inputs = {
-    >           "input_ids": [1, 10],
-    >           "attention_mask": [1, 10],
-    >       }
-    >       with torch.no_grad():
-    >           ov_model = ov.convert_model(
-    >               model_t, 
-    >               example_input={
-    >                   'input_ids': inputs['input_ids'], 
-    >                   'attention_mask': inputs['attention_mask']
-    >               }, 
-    >               input=ov_inputs
-    >           )
+    >   seq_length = 128 
+    >   ov_inputs = {
+    >       "input_ids": [1, seq_length],
+    >       "attention_mask": [1, seq_length],
+    >   }
     >   ```
     > 
-    > * Modified:
-    >   ```py
-    >   token_length = 20 # modify this number.
-    >   if not fp16_text_model_path.exists():
-    >       ov_inputs = {
-    >           "input_ids": [1, token_length],
-    >           "attention_mask": [1, token_length],
-    >       }
-    >       with torch.no_grad():
-    >           ov_model = ov.convert_model(
-    >               model_t, 
-    >               example_input={
-    >                   'input_ids': torch.zeros([1, token_length], dtype=torch.int32), 
-    >                   'attention_mask': torch.zeros([1, token_length], dtype=torch.int32)
-    >               }, 
-    >               input=ov_inputs
-    >           )
-    >   ```
-    >
-
+   
 4. Get static vision embedding model with offloaded preprocessing and post processing
     ```sh
-    python get_static_vision_model.py
+    python get_static_vision_model_openai_clip_ViT_patch32.py
     ```
 5. Get openvino tokenizer
     ```sh
-    python get_ov_tokenizer.py
+    python get_ov_tokenizer_clip_ViT_B_32_multilingual.py
     ```
-6. Run inference for CLIP
+6. Run inference for sentence-transformers/clip-ViT-B-32-multilingual-v1 (text embedding) + openai/clip-vit-base-patch32 (vision embedding)
     * Run sample for models include preprocessing and post processing
         ```py
-        python infer.py
+        python infer_clip_ViT_B_32.py
         ```
 
-    * Get Text embedding
+    * Simple test Text embedding
         ```py
-        python get_text_embedding.py
+        python get_text_embedding_clip_ViT_B_32_multilingual.py
         ```
-    * Get Vision embedding
+    * simple test Vision embedding
         ```py
-        python get_vision_embedding.py
+        python get_vision_embedding_openai_clip_ViT_patch32.py
         ```
+
+## Benchmark (latency / throughput / memory / cache)
+
+This repo also ships two benchmark drivers for sweeping `{vision, text} × {CPU, GPU, NPU}`:
+
+| Script                  | What it runs                                                                                                  |
+|-------------------------|---------------------------------------------------------------------------------------------------------------|
+| `bench_app.py`          | Wraps Intel's `openvino.tools.benchmark` (the `benchmark_app` tool). Reports read / compile / first / avg / median / FPS plus `.blob` cache size and process RSS delta. NPU uses an in-process OV-API fallback that reuses the cached `.blob` to work around a 2026.3 dev-build pybind issue. |
+| `bench_official_sync.py`| Wraps the unmodified Intel sample `samples/python/benchmark/sync_benchmark/sync_benchmark.py` from the toolkit distribution and prints a side-by-side comparison vs `bench_app.py`. |
+| `_bench_launcher.py`    | Tiny entry-point used by `bench_app.py` to invoke `openvino.tools.benchmark.main.main()` as a subprocess (the bundled `main.py` has no `__main__` guard). |
+
+Usage (after activating `clip_venv` and sourcing the OpenVINO `setupvars.ps1`):
+
+```powershell
+# Full sweep with our wrapper, 60 s/pair
+python bench_app.py -t 60 --save-json bench_report.json
+
+# Cross-check against the official Intel sync_benchmark.py sample
+python bench_official_sync.py --compare bench_report.json
+```
+
+Latest test report: see [`2026-05-22-benchmark-results.md`](./2026-05-22-benchmark-results.md).
+

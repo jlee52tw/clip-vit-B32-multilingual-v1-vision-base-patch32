@@ -103,7 +103,7 @@ def main():
     logit_scale = 100
     logits_per_text = np.zeros([10])
     for i in range(len(input_labels)):
-        logits_per_text[i] = np.matmul(text_embeds[i], np.transpose(image_embeds)) * logit_scale
+        logits_per_text[i] = np.matmul(text_embeds[i], np.transpose(image_embeds)).squeeze() * logit_scale
     
     end_t = time.time()
     print ("Run inference time: ", (end_t - start_t))

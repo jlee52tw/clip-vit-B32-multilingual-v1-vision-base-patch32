@@ -1,0 +1,20 @@
+# venv, caches, logs, large generated artifacts
+clip_venv/
+cache/
+bench_cache/
+*.log
+bench_stdout.txt
+bench_stderr.txt
+
+# Generated OpenVINO IRs (large; produced by the get_static_*.py / get_ov_tokenizer_*.py scripts)
+ov_models/*.bin
+ov_models/*.xml
+ov_tokenizer/*.bin
+ov_tokenizer/*.xml
+
+# Downloaded sample data
+data/
+
+# Python bytecode
+__pycache__/
+*.pyc
